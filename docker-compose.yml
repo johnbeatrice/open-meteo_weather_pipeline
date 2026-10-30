@@ -1,0 +1,121 @@
+# This docker-compose file defines containers used for batch pipelines
+# SILO for S3 bucket (Fork of MinIO by Pigsty)
+
+# NOTE: AWS requires hyphens "-" to be used in some cases instead of underscores "_". This took some time to uncover, even with Gemini.
+
+# Instructions:
+# Run "docker compose up -d"
+# check http://localhost:9001 in browser ad log in with Silo credentials to confirm the "warehouse" path/bucket was created in the s3 container
+
+services:
+# S3 bucket
+  silo-warehouse:
+    image: docker.io/pgsty/silo:RELEASE.2026-10-18T00-00-00Z
+    # container_name: silo_warehouse
+    restart: unless-stopped
+    networks:
+      - my-docker-network
+    # Not exposing any ports right now for network security
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - silo-warehouse-data:/data
+    command: server /silo-warehouse-data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "silo", "healthcheck", "live"]
+      interval: 5s     # Run the check every 5 seconds for fast cluster discovery
+      timeout: 3s      # If the API doesn't respond in 3 seconds, flag it as a failed check
+      retries: 3       # Must fail 3 consecutive times before flagging the container as "unhealthy"
+      start_period: 5s # Gives Silo 5 seconds to load database structures before starting checks
+
+# create the "warehouse" root path to point the iceberg catalog to
+  silo-warehouse-initializer:
+    image: docker.io/pgsty/mc:RELEASE.2026-10-26T00-00-00Z
+    # container_name: silo_warehouse_initializer
+    networks:
+      - my-docker-network
+    depends_on:
+      silo-warehouse:
+        condition: service_healthy # Waits for Silo to be fully up
+    restart: on-failure
+    # Pass the .env variables into the container environment first, then call them in the "entrypoint" script below
+    environment:
+      - SILO_USER=${MINIO_ROOT_USER}
+      - SILO_PASS=${MINIO_ROOT_PASSWORD}
+    # entrypoint: >
+    #   /bin/sh -c "
+    #   sleep 5;
+    #   /usr/bin/mc alias set silo-alias http://silo-warehouse:9000 $${SILO_USER} $${SILO_PASS};
+    #   /usr/bin/mc mb silo-alias/warehouse;
+    #   exit 0;
+    #   "
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      /usr/bin/mc alias set silo-alias http://silo-warehouse:9000 $${SILO_USER} $${SILO_PASS};
+      /usr/bin/mc mb silo-alias/warehouse;
+      
+      echo '\n🔍 VERIFYING STACK READINESS...';
+      
+      if /usr/bin/mc ls silo-alias/warehouse > /dev/null 2>&1; then
+          echo '✅ SUCCESS: Silo S3 bucket \"s3://warehouse/\" successfully created.';
+      else
+          echo '❌ ERROR: Silo bucket creation failed.';
+          exit 1;
+      fi;
+      
+      if /usr/bin/mc admin info silo-alias > /dev/null 2>&1; then
+          echo '✅ SUCCESS: Storage client safely authorized against Silo endpoint.';
+      else
+          echo '❌ ERROR: Authorization check against storage layer failed.';
+          exit 1;
+      fi;
+      
+      echo '\n🎉 [READY] Infrastructure ready!\n';
+      exit 0;
+      "
+
+    
+
+
+# The Iceberg REST Catalog Server (In-Memory)
+  iceberg-catalog:
+    image: apache/iceberg-rest-fixture:1.10.1
+    # container_name: iceberg-catalog
+    networks:
+      - my-docker-network
+    # Not exposing any ports right now for network security
+    ports:
+      - "8181:8181"
+    depends_on:
+      silo-warehouse-initializer:
+        condition: service_completed_successfully # Iceberg ONLY starts after the bucket is guaranteed to exist
+    environment:
+      # Directs Iceberg to store its actual data files in our local MinIO container
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      # Points the internal catalog framework to the MinIO container endpoint
+      CATALOG_S3_ENDPOINT: http://silo-warehouse:9000
+      CATALOG_S3_PATH_STYLE_ACCESS: true
+    # aws connection credentials for s3 bucket
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+    volumes:
+      - iceberg-metadata:/app/data
+    # Health check ?
+    # the apache/iceberg-rest-fixture:1.10.1 image comes with its own internal healthcheck
+
+volumes:
+# Persists the raw S3 bucket
+  silo-warehouse-data:
+# Persists the Iceberg catalog namespace and table registration state
+  iceberg-metadata:
+
+networks:
+  my-docker-network:
+    driver: bridge
